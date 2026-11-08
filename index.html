@@ -29,8 +29,10 @@
   #status{font-size:13px;margin-top:8px;}
   .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px;}
   .kpi{background:var(--card);border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:5px solid var(--accent);}
+  .kpi.warn{border-left-color:var(--warn);}
   .kpi .label{font-size:12px;color:#666;text-transform:uppercase;letter-spacing:.5px;}
   .kpi .value{font-size:28px;font-weight:bold;color:var(--accent);margin-top:4px;}
+  .kpi.warn .value{color:#B5790C;}
   .kpi .sub{font-size:12px;color:#888;margin-top:4px;}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;}
   @media(max-width:860px){.grid2{grid-template-columns:1fr;}}
@@ -41,6 +43,8 @@
   th{background:var(--accent2);color:var(--accent);font-weight:bold;}
   tr:hover td{background:#fafbff;}
   .pill{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:bold;color:#fff;}
+  .pill.own{background:var(--good);}
+  .pill.cons{background:var(--warn);}
   .loading{text-align:center;padding:40px;color:#888;}
 </style>
 </head>
@@ -77,35 +81,35 @@
   <div id="dashboardContent" style="display:none;">
 
     <div class="kpi-grid">
-      <div class="kpi"><div class="label">Выручка (все сделки)</div><div class="value" id="kpiRevenue">—</div></div>
-      <div class="kpi"><div class="label">Чистая прибыль</div><div class="value" id="kpiProfit">—</div></div>
+      <div class="kpi"><div class="label">Оборот (все продажи)</div><div class="value" id="kpiRevenue">—</div><div class="sub">включая деньги владельцев товара</div></div>
+      <div class="kpi"><div class="label">Моя чистая прибыль</div><div class="value" id="kpiProfit">—</div></div>
+      <div class="kpi warn"><div class="label">Долг перед владельцами</div><div class="value" id="kpiOwed">—</div><div class="sub">не выплачено по комиссии</div></div>
       <div class="kpi"><div class="label">% от цели (тек. месяц)</div><div class="value" id="kpiTarget">—</div></div>
-      <div class="kpi"><div class="label">Средняя наценка</div><div class="value" id="kpiMarkup">—</div></div>
     </div>
 
     <div class="card" style="margin-bottom:20px;">
-      <h3>Чистая прибыль по месяцам vs цель</h3>
+      <h3>Моя чистая прибыль по месяцам vs цель</h3>
       <canvas id="profitChart" height="90"></canvas>
     </div>
 
     <div class="grid2">
       <div class="card">
-        <h3>ROI по каналам продаж</h3>
+        <h3>ROI по каналам продаж (на основе моей маржи)</h3>
         <canvas id="roiChart" height="220"></canvas>
       </div>
       <div class="card">
-        <h3>Доля продаж по каналам</h3>
-        <canvas id="channelPie" height="220"></canvas>
+        <h3>Доля продаж: свой товар vs комиссия</h3>
+        <canvas id="ownershipPie" height="220"></canvas>
       </div>
     </div>
 
     <div class="grid2">
       <div class="card">
-        <h3>Маржа по категориям (топ-10)</h3>
+        <h3>Маржа по категориям (топ-10, моя прибыль)</h3>
         <div id="categoryTable"></div>
       </div>
       <div class="card">
-        <h3>Новые vs Б/у</h3>
+        <h3>Новые vs Б/у (моя прибыль)</h3>
         <div id="typeTable"></div>
       </div>
     </div>
@@ -125,9 +129,8 @@
 const LS_KEY = "avtozapchasti_dashboard_urls";
 let rowsSdelki = [];
 let rowsKanaly = [];
-let profitChart, roiChart, channelPie;
+let profitChart, roiChart, ownershipPie;
 
-// ---------- Вспомогательные функции ----------
 function parseNum(v){
   if(v===null||v===undefined) return 0;
   let s = String(v).trim();
@@ -161,7 +164,6 @@ function getField(row, names){
 function fmtMoney(n){ return Math.round(n).toLocaleString("ru-RU") + " ₽"; }
 function fmtPct(n){ return (n*100).toFixed(1) + "%"; }
 
-// ---------- Загрузка CSV ----------
 function fetchCsv(url){
   return new Promise((resolve, reject)=>{
     const bust = url + (url.includes("?") ? "&" : "?") + "_t=" + Date.now();
@@ -201,14 +203,17 @@ async function loadData(){
   }
 }
 
-// ---------- Отрисовка ----------
 function renderAll(){
   const target = parseFloat(document.getElementById("targetInput").value) || 500000;
 
+  // "Моя маржа, ₽" — приоритетное поле (учитывает комиссию), запасной вариант — старая "Маржа, ₽"
   const FIELD = {
     category: ["Категория детали"],
     type: ["Тип товара"],
-    margin: ["Маржа, ₽","Маржа ₽","Маржа"],
+    myMargin: ["Моя маржа, ₽","Моя маржа","Маржа, ₽","Маржа ₽","Маржа"],
+    owed: ["К выплате владельцу, ₽","К выплате владельцу"],
+    paidStatus: ["Выплачено владельцу"],
+    ownership: ["Схема работы"],
     markup: ["Наценка, %","Наценка %","Наценка"],
     sale: ["Цена продажи"],
     buy: ["Цена закупки"],
@@ -227,18 +232,19 @@ function renderAll(){
   };
 
   // KPI
-  let totalRevenue = 0, totalProfit = 0, markupSum = 0, markupCount = 0;
+  let totalRevenue = 0, totalMyProfit = 0, totalOwed = 0;
   rowsSdelki.forEach(r=>{
     totalRevenue += parseNum(getField(r, FIELD.sale));
-    totalProfit  += parseNum(getField(r, FIELD.margin));
-    const mk = parseNum(getField(r, FIELD.markup));
-    if(mk){ markupSum += mk; markupCount++; }
+    totalMyProfit += parseNum(getField(r, FIELD.myMargin));
+    const paidRaw = String(getField(r, FIELD.paidStatus) || "").trim().toLowerCase();
+    const isPaid = paidRaw === "да" || paidRaw === "yes";
+    if(!isPaid) totalOwed += parseNum(getField(r, FIELD.owed));
   });
   document.getElementById("kpiRevenue").textContent = fmtMoney(totalRevenue);
-  document.getElementById("kpiProfit").textContent = fmtMoney(totalProfit);
-  document.getElementById("kpiMarkup").textContent = markupCount ? (markupSum/markupCount).toFixed(1)+"%" : "—";
+  document.getElementById("kpiProfit").textContent = fmtMoney(totalMyProfit);
+  document.getElementById("kpiOwed").textContent = fmtMoney(totalOwed);
 
-  // Прибыль по месяцам (из листа "Каналы по месяцам")
+  // Прибыль по месяцам (из листа "Каналы по месяцам" — должен считаться от "Моя маржа")
   const monthMap = {};
   rowsKanaly.forEach(r=>{
     const m = String(getField(r, KFIELD.month) || "").trim();
@@ -254,13 +260,13 @@ function renderAll(){
   profitChart = new Chart(document.getElementById("profitChart"), {
     type:"line",
     data:{ labels: months, datasets:[
-      { label:"Чистая прибыль", data: profits, borderColor:"#1E2761", backgroundColor:"rgba(30,39,97,.15)", fill:true, tension:.3 },
+      { label:"Моя чистая прибыль", data: profits, borderColor:"#1E2761", backgroundColor:"rgba(30,39,97,.15)", fill:true, tension:.3 },
       { label:"Цель", data: months.map(()=>target), borderColor:"#D7263D", borderDash:[6,4], pointRadius:0 }
     ]},
     options:{ responsive:true, plugins:{legend:{position:"bottom"}}, scales:{y:{beginAtZero:true}} }
   });
 
-  // ROI по каналам (агрегация по всем месяцам)
+  // ROI по каналам
   const chanAgg = {};
   rowsKanaly.forEach(r=>{
     const c = String(getField(r, KFIELD.channel) || "—").trim();
@@ -279,34 +285,32 @@ function renderAll(){
     options:{ responsive:true, plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}} }
   });
 
-  // Доля продаж по каналам (из "Сделки")
-  const chanCount = {};
+  // Свой товар vs Комиссия
+  const ownAgg = {};
   rowsSdelki.forEach(r=>{
-    const c = String(getField(r, FIELD.channel) || "—").trim();
-    chanCount[c] = (chanCount[c]||0) + 1;
+    const t = String(getField(r, FIELD.ownership) || "Свой").trim();
+    ownAgg[t] = (ownAgg[t]||0) + 1;
   });
-  if(channelPie) channelPie.destroy();
-  channelPie = new Chart(document.getElementById("channelPie"), {
+  if(ownershipPie) ownershipPie.destroy();
+  ownershipPie = new Chart(document.getElementById("ownershipPie"), {
     type:"doughnut",
-    data:{ labels: Object.keys(chanCount), datasets:[{ data: Object.values(chanCount),
-      backgroundColor:["#1E2761","#028090","#02C39A","#F4A537","#D7263D","#97BC62","#6D2E46","#21295C"] }] },
+    data:{ labels: Object.keys(ownAgg), datasets:[{ data: Object.values(ownAgg),
+      backgroundColor:["#1E2761","#F4A537","#02C39A","#D7263D"] }] },
     options:{ responsive:true, plugins:{legend:{position:"right"}} }
   });
 
-  // Маржа по категориям
+  // Маржа по категориям (моя прибыль)
   const catAgg = {};
   rowsSdelki.forEach(r=>{
     const cat = String(getField(r, FIELD.category) || "Без категории").trim();
-    if(!catAgg[cat]) catAgg[cat] = {margin:0, count:0, markupSum:0, markupCnt:0};
-    catAgg[cat].margin += parseNum(getField(r, FIELD.margin));
+    if(!catAgg[cat]) catAgg[cat] = {margin:0, count:0};
+    catAgg[cat].margin += parseNum(getField(r, FIELD.myMargin));
     catAgg[cat].count += 1;
-    const mk = parseNum(getField(r, FIELD.markup));
-    if(mk){ catAgg[cat].markupSum += mk; catAgg[cat].markupCnt++; }
   });
   const catRows = Object.entries(catAgg).sort((a,b)=>b[1].margin-a[1].margin).slice(0,10);
-  let catHtml = "<table><tr><th>Категория</th><th>Сделок</th><th>Сумма маржи</th><th>Ср. наценка</th></tr>";
+  let catHtml = "<table><tr><th>Категория</th><th>Сделок</th><th>Моя прибыль</th></tr>";
   catRows.forEach(([cat,d])=>{
-    catHtml += `<tr><td>${cat}</td><td>${d.count}</td><td>${fmtMoney(d.margin)}</td><td>${d.markupCnt ? (d.markupSum/d.markupCnt).toFixed(1)+"%" : "—"}</td></tr>`;
+    catHtml += `<tr><td>${cat}</td><td>${d.count}</td><td>${fmtMoney(d.margin)}</td></tr>`;
   });
   catHtml += "</table>";
   document.getElementById("categoryTable").innerHTML = catHtml || "<p>Нет данных</p>";
@@ -316,10 +320,10 @@ function renderAll(){
   rowsSdelki.forEach(r=>{
     const t = String(getField(r, FIELD.type) || "—").trim();
     if(!typeAgg[t]) typeAgg[t] = {margin:0, count:0};
-    typeAgg[t].margin += parseNum(getField(r, FIELD.margin));
+    typeAgg[t].margin += parseNum(getField(r, FIELD.myMargin));
     typeAgg[t].count += 1;
   });
-  let typeHtml = "<table><tr><th>Тип товара</th><th>Сделок</th><th>Сумма маржи</th><th>Средняя маржа</th></tr>";
+  let typeHtml = "<table><tr><th>Тип товара</th><th>Сделок</th><th>Моя прибыль</th><th>Средняя</th></tr>";
   Object.entries(typeAgg).forEach(([t,d])=>{
     typeHtml += `<tr><td>${t}</td><td>${d.count}</td><td>${fmtMoney(d.margin)}</td><td>${fmtMoney(d.count ? d.margin/d.count : 0)}</td></tr>`;
   });
@@ -332,22 +336,23 @@ function renderAll(){
     const db = parseDateRu(getField(b, FIELD.saleDate)) || new Date(0);
     return db - da;
   }).slice(0,10);
-  let recHtml = "<table><tr><th>Дата</th><th>Марка/модель</th><th>Категория</th><th>Канал</th><th>Цена продажи</th><th>Маржа</th></tr>";
+  let recHtml = "<table><tr><th>Дата</th><th>Марка/модель</th><th>Схема</th><th>Канал</th><th>Цена продажи</th><th>Моя прибыль</th></tr>";
   sorted.forEach(r=>{
+    const scheme = String(getField(r, FIELD.ownership) || "Свой").trim();
+    const pillClass = scheme.toLowerCase().includes("комис") ? "cons" : "own";
     recHtml += `<tr>
       <td>${getField(r, FIELD.saleDate) || "—"}</td>
       <td>${getField(r, FIELD.brand) || "—"}</td>
-      <td>${getField(r, FIELD.category) || "—"}</td>
+      <td><span class="pill ${pillClass}">${scheme}</span></td>
       <td>${getField(r, FIELD.channel) || "—"}</td>
       <td>${fmtMoney(parseNum(getField(r, FIELD.sale)))}</td>
-      <td>${fmtMoney(parseNum(getField(r, FIELD.margin)))}</td>
+      <td>${fmtMoney(parseNum(getField(r, FIELD.myMargin)))}</td>
     </tr>`;
   });
   recHtml += "</table>";
   document.getElementById("recentTable").innerHTML = recHtml;
 }
 
-// ---------- Инициализация ----------
 document.getElementById("saveBtn").addEventListener("click", loadData);
 document.getElementById("refreshBtn").addEventListener("click", loadData);
 document.getElementById("targetInput").addEventListener("change", ()=>{ if(rowsSdelki.length) renderAll(); });
