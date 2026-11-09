@@ -27,6 +27,7 @@
   .settings-row input[type=text]{padding:8px;border:1px solid #ccc;border-radius:6px;font-size:13px;width:100%;}
   .settings-row button{align-self:flex-start;background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;margin-top:4px;}
   #status{font-size:13px;margin-top:8px;}
+  #debugBox{font-size:12px;color:#555;background:#f7f7fb;border:1px solid #e0e0ea;border-radius:8px;padding:10px;margin-top:10px;display:none;white-space:pre-wrap;}
   .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px;}
   .kpi{background:var(--card);border-radius:10px;padding:18px;box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:5px solid var(--accent);}
   .kpi.warn{border-left-color:var(--warn);}
@@ -75,6 +76,8 @@
       <input type="text" id="url2" placeholder="https://docs.google.com/spreadsheets/d/.../pub?gid=123456&single=true&output=csv">
       <button id="saveBtn">💾 Сохранить и загрузить</button>
       <div id="status"></div>
+      <label style="margin-top:6px;"><input type="checkbox" id="debugToggle"> Показать технические названия колонок (для диагностики)</label>
+      <div id="debugBox"></div>
     </div>
   </details>
 
@@ -149,14 +152,24 @@ function parseDateRu(v){
   let d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
+function norm(s){
+  return String(s||"").toLowerCase().replace(/[^a-zа-яё0-9]/gi,"");
+}
+// Гибкий поиск колонки: сравнивает не только точное совпадение, но и
+// "начинается с" в обе стороны — чтобы "Цена продажи" находила колонку
+// "Цена продажи, Р", а "Чистая прибыль" находила
+// "Чистая прибыль (с учётом рекламы), Р" и т.п.
 function getField(row, names){
   for(const n of names){ if(row[n]!==undefined && row[n]!=="") return row[n]; }
   const keys = Object.keys(row);
   for(const n of names){
-    const norm = n.toLowerCase().replace(/[^a-zа-яё0-9]/gi,"");
+    const target = norm(n);
+    if(!target) continue;
     for(const k of keys){
-      const kn = k.toLowerCase().replace(/[^a-zа-яё0-9]/gi,"");
-      if(kn===norm) return row[k];
+      const kn = norm(k);
+      if(kn === target || kn.startsWith(target) || target.startsWith(kn)){
+        if(row[k] !== undefined && row[k] !== "") return row[k];
+      }
     }
   }
   return undefined;
@@ -173,6 +186,63 @@ function fetchCsv(url){
       error: err => reject(err)
     });
   });
+}
+
+const FIELD = {
+  category: ["Категория детали"],
+  type: ["Тип (б/у/Новый)", "Тип товара", "Тип"],
+  ownership: ["Схема работы", "Схема"],
+  share: ["Доля, %", "Доля"],
+  myMargin: ["Моя маржа, ₽","Моя маржа","Маржа, ₽","Маржа ₽","Маржа"],
+  owed: ["К выплате владельцу, ₽","К выплате владельцу"],
+  paidStatus: ["Выплачено владельцу","Выплачено"],
+  sale: ["Цена продажи"],
+  buy: ["Цена закупки"],
+  extra: ["Доп. расходы", "Доп расходы"],
+  saleDate: ["Дата продажи"],
+  channel: ["Канал продажи"],
+  brand: ["Марка/модель авто","Марка/модель"],
+};
+const KFIELD = {
+  channel: ["Канал"],
+  month: ["Месяц"],
+  spend: ["Затраты на рекламу","Затраты"],
+  sales: ["Число продаж","Количество продаж","Количество сделок"],
+  revenue: ["Выручка"],
+  profit: ["Чистая прибыль","Прибыль"],
+};
+
+// Расчёт моей маржи "на лету": если в таблице уже есть явная колонка
+// "Моя маржа" — берём её. Если нет, но заполнены "Схема работы" = Комиссия
+// и "Доля, %" — считаем по комиссионной логике. Если ничего из этого нет —
+// считаем как обычный товар: Цена продажи − Цена закупки − Доп. расходы.
+function computeMargin(row){
+  const explicit = getField(row, FIELD.myMargin);
+  if(explicit !== undefined && String(explicit).trim() !== ""){
+    return parseNum(explicit);
+  }
+  const sale = parseNum(getField(row, FIELD.sale));
+  const buy  = parseNum(getField(row, FIELD.buy));
+  const extra = parseNum(getField(row, FIELD.extra));
+  const scheme = String(getField(row, FIELD.ownership) || "").trim().toLowerCase();
+  const share = parseNum(getField(row, FIELD.share));
+  if(scheme.includes("комис") && share > 0){
+    return sale * share / 100 - extra;
+  }
+  return sale - buy - extra;
+}
+function computeOwed(row){
+  const explicit = getField(row, FIELD.owed);
+  if(explicit !== undefined && String(explicit).trim() !== ""){
+    return parseNum(explicit);
+  }
+  const sale = parseNum(getField(row, FIELD.sale));
+  const scheme = String(getField(row, FIELD.ownership) || "").trim().toLowerCase();
+  const share = parseNum(getField(row, FIELD.share));
+  if(scheme.includes("комис") && share > 0){
+    return sale * (1 - share/100);
+  }
+  return 0;
 }
 
 async function loadData(){
@@ -193,6 +263,9 @@ async function loadData(){
     localStorage.setItem(LS_KEY, JSON.stringify({url1,url2}));
     status.textContent = "✅ Данные загружены (" + rowsSdelki.length + " сделок, " + rowsKanaly.length + " строк по каналам). Обновлено: " + new Date().toLocaleTimeString("ru-RU");
     status.style.color = "var(--good)";
+    const dbg = document.getElementById("debugBox");
+    dbg.textContent = "Колонки «Сделки»: " + (rowsSdelki[0] ? Object.keys(rowsSdelki[0]).join(" | ") : "нет данных") +
+      "\n\nКолонки «Каналы по месяцам»: " + (rowsKanaly[0] ? Object.keys(rowsKanaly[0]).join(" | ") : "нет данных");
     document.getElementById("loadingMsg").style.display="none";
     document.getElementById("dashboardContent").style.display="block";
     renderAll();
@@ -206,45 +279,20 @@ async function loadData(){
 function renderAll(){
   const target = parseFloat(document.getElementById("targetInput").value) || 500000;
 
-  // "Моя маржа, ₽" — приоритетное поле (учитывает комиссию), запасной вариант — старая "Маржа, ₽"
-  const FIELD = {
-    category: ["Категория детали"],
-    type: ["Тип товара"],
-    myMargin: ["Моя маржа, ₽","Моя маржа","Маржа, ₽","Маржа ₽","Маржа"],
-    owed: ["К выплате владельцу, ₽","К выплате владельцу"],
-    paidStatus: ["Выплачено владельцу"],
-    ownership: ["Схема работы"],
-    markup: ["Наценка, %","Наценка %","Наценка"],
-    sale: ["Цена продажи"],
-    buy: ["Цена закупки"],
-    saleDate: ["Дата продажи"],
-    channel: ["Канал продажи"],
-    brand: ["Марка/модель авто","Марка/модель"],
-    status: ["Статус сделки"]
-  };
-  const KFIELD = {
-    channel: ["Канал"],
-    month: ["Месяц"],
-    spend: ["Затраты на рекламу","Затраты"],
-    sales: ["Количество продаж","Количество сделок"],
-    revenue: ["Выручка"],
-    profit: ["Чистая прибыль","Прибыль"],
-  };
-
   // KPI
   let totalRevenue = 0, totalMyProfit = 0, totalOwed = 0;
   rowsSdelki.forEach(r=>{
     totalRevenue += parseNum(getField(r, FIELD.sale));
-    totalMyProfit += parseNum(getField(r, FIELD.myMargin));
+    totalMyProfit += computeMargin(r);
     const paidRaw = String(getField(r, FIELD.paidStatus) || "").trim().toLowerCase();
     const isPaid = paidRaw === "да" || paidRaw === "yes";
-    if(!isPaid) totalOwed += parseNum(getField(r, FIELD.owed));
+    if(!isPaid) totalOwed += computeOwed(r);
   });
   document.getElementById("kpiRevenue").textContent = fmtMoney(totalRevenue);
   document.getElementById("kpiProfit").textContent = fmtMoney(totalMyProfit);
   document.getElementById("kpiOwed").textContent = fmtMoney(totalOwed);
 
-  // Прибыль по месяцам (из листа "Каналы по месяцам" — должен считаться от "Моя маржа")
+  // Прибыль по месяцам (из листа "Каналы по месяцам")
   const monthMap = {};
   rowsKanaly.forEach(r=>{
     const m = String(getField(r, KFIELD.month) || "").trim();
@@ -266,10 +314,12 @@ function renderAll(){
     options:{ responsive:true, plugins:{legend:{position:"bottom"}}, scales:{y:{beginAtZero:true}} }
   });
 
-  // ROI по каналам
+  // ROI по каналам (пропускаем строки без названия канала — это "пустые"
+  // строки-заготовки в конце листа)
   const chanAgg = {};
   rowsKanaly.forEach(r=>{
-    const c = String(getField(r, KFIELD.channel) || "—").trim();
+    const c = String(getField(r, KFIELD.channel) || "").trim();
+    if(!c) return;
     if(!chanAgg[c]) chanAgg[c] = {spend:0, profit:0};
     chanAgg[c].spend  += parseNum(getField(r, KFIELD.spend));
     chanAgg[c].profit += parseNum(getField(r, KFIELD.profit));
@@ -304,7 +354,7 @@ function renderAll(){
   rowsSdelki.forEach(r=>{
     const cat = String(getField(r, FIELD.category) || "Без категории").trim();
     if(!catAgg[cat]) catAgg[cat] = {margin:0, count:0};
-    catAgg[cat].margin += parseNum(getField(r, FIELD.myMargin));
+    catAgg[cat].margin += computeMargin(r);
     catAgg[cat].count += 1;
   });
   const catRows = Object.entries(catAgg).sort((a,b)=>b[1].margin-a[1].margin).slice(0,10);
@@ -320,7 +370,7 @@ function renderAll(){
   rowsSdelki.forEach(r=>{
     const t = String(getField(r, FIELD.type) || "—").trim();
     if(!typeAgg[t]) typeAgg[t] = {margin:0, count:0};
-    typeAgg[t].margin += parseNum(getField(r, FIELD.myMargin));
+    typeAgg[t].margin += computeMargin(r);
     typeAgg[t].count += 1;
   });
   let typeHtml = "<table><tr><th>Тип товара</th><th>Сделок</th><th>Моя прибыль</th><th>Средняя</th></tr>";
@@ -346,7 +396,7 @@ function renderAll(){
       <td><span class="pill ${pillClass}">${scheme}</span></td>
       <td>${getField(r, FIELD.channel) || "—"}</td>
       <td>${fmtMoney(parseNum(getField(r, FIELD.sale)))}</td>
-      <td>${fmtMoney(parseNum(getField(r, FIELD.myMargin)))}</td>
+      <td>${fmtMoney(computeMargin(r))}</td>
     </tr>`;
   });
   recHtml += "</table>";
@@ -356,6 +406,9 @@ function renderAll(){
 document.getElementById("saveBtn").addEventListener("click", loadData);
 document.getElementById("refreshBtn").addEventListener("click", loadData);
 document.getElementById("targetInput").addEventListener("change", ()=>{ if(rowsSdelki.length) renderAll(); });
+document.getElementById("debugToggle").addEventListener("change", (e)=>{
+  document.getElementById("debugBox").style.display = e.target.checked ? "block" : "none";
+});
 
 window.addEventListener("load", ()=>{
   const saved = localStorage.getItem(LS_KEY);
